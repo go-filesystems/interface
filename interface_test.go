@@ -1,6 +1,7 @@
 package filesystem
 
 import (
+	"errors"
 	"os"
 	"testing"
 	"time"
@@ -30,17 +31,18 @@ func (fakeFS) Rename(oldPath, newPath string) error                       { retu
 // since this package has no driver it builds its own minimal mock.
 type capableFS struct{ fakeFS }
 
-func (capableFS) Symlink(target, linkPath string) error          { return nil }
-func (capableFS) Link(oldPath, newPath string) error             { return nil }
-func (capableFS) Truncate(path string, newSize int64) error      { return nil }
-func (capableFS) Chmod(path string, perm os.FileMode) error      { return nil }
-func (capableFS) Chown(path string, uid, gid uint32) error       { return nil }
+func (capableFS) Symlink(target, linkPath string) error     { return nil }
+func (capableFS) Link(oldPath, newPath string) error        { return nil }
+func (capableFS) Truncate(path string, newSize int64) error { return nil }
+func (capableFS) Chmod(path string, perm os.FileMode) error { return nil }
+func (capableFS) Chown(path string, uid, gid uint32) error  { return nil }
 func (capableFS) Chtimes(path string, atime, mtime time.Time) error {
 	return nil
 }
-func (capableFS) Label() string                  { return "" }
-func (capableFS) SetLabel(label string) error    { return nil }
+func (capableFS) Label() string                   { return "" }
+func (capableFS) SetLabel(label string) error     { return nil }
 func (capableFS) GrowTo(newSizeBytes int64) error { return nil }
+func (capableFS) Resize(newSize int64) error      { return nil }
 
 var (
 	_ Filesystem     = (*capableFS)(nil)
@@ -51,6 +53,7 @@ var (
 	_ LabelReader    = (*capableFS)(nil) // satisfied transitively via Labeller
 	_ Labeller       = (*capableFS)(nil)
 	_ Grower         = (*capableFS)(nil)
+	_ Resizer        = (*capableFS)(nil)
 )
 
 // readonlyLabelFS only implements LabelReader (no SetLabel) — models
@@ -88,6 +91,9 @@ func TestCapabilityProbes(t *testing.T) {
 	if _, ok := fs.(Grower); !ok {
 		t.Error("Grower probe failed on capableFS")
 	}
+	if _, ok := fs.(Resizer); !ok {
+		t.Error("Resizer probe failed on capableFS")
+	}
 
 	// Conversely, the bare fakeFS implements only Filesystem — every
 	// capability probe must report false. This guards the contract:
@@ -100,6 +106,9 @@ func TestCapabilityProbes(t *testing.T) {
 	if _, ok := bare.(Truncater); ok {
 		t.Error("Truncater probe unexpectedly succeeded on fakeFS")
 	}
+	if _, ok := bare.(Resizer); ok {
+		t.Error("Resizer probe unexpectedly succeeded on fakeFS")
+	}
 
 	// readonlyLabelFS implements Label() but not SetLabel() — proves
 	// the Labeller / LabelReader split lets generic code probe each
@@ -110,6 +119,42 @@ func TestCapabilityProbes(t *testing.T) {
 	}
 	if _, ok := ro.(Labeller); ok {
 		t.Error("Labeller probe unexpectedly succeeded on readonlyLabelFS (it only reads)")
+	}
+}
+
+// shrinkUnsupportedFS models an XFS/ZFS-style driver that can grow
+// but rejects shrink with the package sentinel.
+type shrinkUnsupportedFS struct{ fakeFS }
+
+func (shrinkUnsupportedFS) Resize(newSize int64) error {
+	if newSize < 1024 { // arbitrary "current size" for the test
+		return ErrShrinkUnsupported
+	}
+	return nil
+}
+
+var _ Resizer = (*shrinkUnsupportedFS)(nil)
+
+func TestErrShrinkUnsupported(t *testing.T) {
+	if ErrShrinkUnsupported == nil {
+		t.Fatal("ErrShrinkUnsupported sentinel is nil")
+	}
+	if ErrShrinkUnsupported.Error() != "filesystem: shrink not supported" {
+		t.Fatalf("ErrShrinkUnsupported message = %q", ErrShrinkUnsupported.Error())
+	}
+	// Probe via the Resizer interface to make sure the sentinel is
+	// usable with errors.Is — the documented contract for callers.
+	var fs Filesystem = shrinkUnsupportedFS{}
+	r, ok := fs.(Resizer)
+	if !ok {
+		t.Fatal("shrinkUnsupportedFS does not satisfy Resizer")
+	}
+	if err := r.Resize(2048); err != nil {
+		t.Fatalf("Resize(grow) returned %v, want nil", err)
+	}
+	err := r.Resize(512)
+	if !errors.Is(err, ErrShrinkUnsupported) {
+		t.Fatalf("Resize(shrink) = %v, want ErrShrinkUnsupported", err)
 	}
 }
 
