@@ -59,6 +59,78 @@ if l, ok := fs.(filesystem.Labeller); ok {
 }
 ```
 
+- `LabelReader` — optional read-only counterpart to `Labeller`, for drivers
+  that can decode a volume label but can't yet rewrite it through their
+  regular commit machinery. Every `Labeller` embeds this, so type-assert
+  `LabelReader` when only reading is needed:
+
+```go
+type LabelReader interface {
+    Label() string
+}
+```
+
+- `Symlinker` — optional interface for creating symbolic links (`ReadLink`
+  is already part of `Filesystem`; this gates the write side):
+
+```go
+type Symlinker interface {
+    Symlink(target, linkPath string) error
+}
+```
+
+- `HardLinker` — optional interface for POSIX hardlinks (directories cannot
+  be hardlinked; implementations must reject that case):
+
+```go
+type HardLinker interface {
+    Link(oldPath, newPath string) error
+}
+```
+
+- `MetadataSetter` — optional interface bundling the POSIX metadata mutators
+  (chmod / chown / utimes):
+
+```go
+type MetadataSetter interface {
+    Chmod(path string, perm os.FileMode) error
+    Chown(path string, uid, gid uint32) error
+    Chtimes(path string, atime, mtime time.Time) error
+}
+```
+
+- `Truncater` — optional interface for resizing a regular file in place
+  (grow zero-fills, shrink drops trailing data):
+
+```go
+type Truncater interface {
+    Truncate(path string, newSize int64) error
+}
+```
+
+- `Grower` / `Resizer` — optional interfaces for changing a filesystem's
+  on-disk size. `Grower.GrowTo` is grow-only; `Resizer.Resize` is the newer,
+  uniform entry point that also handles shrink where the format allows it,
+  returning the sentinel `ErrShrinkUnsupported` when it doesn't:
+
+```go
+type Grower interface {
+    GrowTo(newSizeBytes int64) error
+}
+
+type Resizer interface {
+    Resize(newSize int64) error
+}
+
+var ErrShrinkUnsupported = errors.New("filesystem: shrink not supported")
+
+if r, ok := fs.(filesystem.Resizer); ok {
+    if err := r.Resize(newSize); errors.Is(err, filesystem.ErrShrinkUnsupported) {
+        // driver only grows — caller decides how to handle
+    }
+}
+```
+
 - `DirEntry` — accessor interface for directory entries:
 
 ```go
@@ -84,18 +156,29 @@ provided for convenience.
 
 ## Implementations
 
-Known implementations in this repository:
+Known implementations, across the [`go-filesystems`](https://github.com/go-filesystems) org:
 
+- `github.com/go-filesystems/apfs`
+- `github.com/go-filesystems/btrfs`
+- `github.com/go-filesystems/exfat`
+- `github.com/go-filesystems/ext4`
+- `github.com/go-filesystems/fat32`
+- `github.com/go-filesystems/ffs` (re-export of `ufs`)
+- `github.com/go-filesystems/hfsplus`
+- `github.com/go-filesystems/iso9660`
+- `github.com/go-filesystems/ntfs`
+- `github.com/go-filesystems/oci`
+- `github.com/go-filesystems/squashfs`
+- `github.com/go-filesystems/uefi`
+- `github.com/go-filesystems/ufs`
 - `github.com/go-filesystems/xfs`
 - `github.com/go-filesystems/zfs`
-- `github.com/go-filesystems/ntfs`
-- `github.com/go-filesystems/ext4`
-- `github.com/go-filesystems/btrfs`
-- `github.com/go-filesystems/fat32`
-- `github.com/go-filesystems/exfat`
 
-See each implementor's README for format-specific details and examples. For
-example: [xfs](../xfs/README.md), [zfs](../zfs/README.md).
+See each implementor's README for format-specific details, examples, and
+which optional interfaces above it satisfies; or see
+[go-filesystems.github.io/docs/drivers](https://go-filesystems.github.io/docs/drivers/)
+for a capability matrix. `github.com/go-filesystems/detect` composes over
+this interface too, as a type-probing dispatch registry rather than a driver.
 
 ## Usage example
 
