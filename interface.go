@@ -2,6 +2,7 @@ package filesystem
 
 import (
 	"errors"
+	"io"
 	"os"
 	"time"
 )
@@ -209,4 +210,78 @@ type Resizer interface {
 	// Returns ErrShrinkUnsupported when the driver doesn't implement shrink
 	// and newSize < current; returns wrapping I/O errors for failed grow.
 	Resize(newSize int64) error
+}
+
+// Opener is the optional interface a filesystem implements when it can read
+// part of a file without materialising the whole thing.
+//
+// The base Filesystem API is per-path: ReadFile(path) returns the ENTIRE file.
+// That is fine for a config file and useless for anything that has to serve
+// reads on demand — a mount, an NFS or 9P export, a loop-mounted image — where
+// answering a 4 KiB request out of a 4 GiB file must not allocate 4 GiB. Opener
+// is the capability that makes those callers possible; it is the single missing
+// piece, not an OS-specific one, so it lives here rather than in any one driver.
+//
+// It is optional and non-breaking by construction: Filesystem is unchanged, and
+// a caller probes for it and falls back when a driver does not have it.
+//
+//	if o, ok := fs.(filesystem.Opener); ok {
+//	    f, err := o.OpenFile(path)
+//	    if err != nil {
+//	        return err
+//	    }
+//	    defer f.Close()
+//	    n, err := f.ReadAt(buf, off)
+//	    ...
+//	}
+//	// otherwise: data, err := fs.ReadFile(path) and slice it.
+//
+// Drivers whose on-disk model cannot answer a byte range without decoding
+// everything before it (whole-file compression, for instance) should simply not
+// implement Opener rather than emulate it with a hidden full read — the point of
+// the probe is that the caller learns the truth and can budget accordingly.
+type Opener interface {
+	// OpenFile opens the regular file at path for random access. The
+	// returned File holds whatever per-file state the driver needs (an
+	// extent list, a cluster chain, a block map); it must be closed by the
+	// caller. Opening must not read the file's contents.
+	//
+	// Implementations reject directories, and paths that do not resolve,
+	// with the same errors their ReadFile would return. The returned File
+	// remains valid only while the Filesystem is open: closing the
+	// Filesystem invalidates every File obtained from it.
+	OpenFile(path string) (File, error)
+}
+
+// File is an open file: random access, and the size the caller needs to
+// answer a stat without reading anything.
+//
+// ReadAt follows io.ReaderAt TO THE LETTER, and that is the whole point of the
+// type. Callers — io.SectionReader, io.NewSectionReader, bufio over one, every
+// generic Go consumer — assume the documented contract:
+//
+//   - ReadAt returns n < len(p) ONLY together with a non-nil error explaining
+//     why. A short read with a nil error is the one behaviour that breaks those
+//     consumers silently, because they treat it as "keep going" and lose data.
+//   - Reading that stops at end of file returns io.EOF, either with the last
+//     bytes (n > 0) or on its own (n == 0). An offset at or past Size() returns
+//     0, io.EOF.
+//   - ReadAt does not affect, and is not affected by, any notion of a seek
+//     offset; each call is independent.
+//   - Multiple ReadAt calls on the same File may run concurrently. Read paths
+//     must therefore not mutate shared state without synchronisation. This too
+//     is io.ReaderAt's contract, and a mount serving parallel requests relies
+//     on it.
+//
+// Size returns the file's length in bytes, taken from the metadata the driver
+// already read when the File was opened, so a caller can answer a stat or size
+// an io.SectionReader without touching the data.
+type File interface {
+	io.ReaderAt
+	io.Closer
+
+	// Size returns the length of the file in bytes, as recorded in the
+	// filesystem's own metadata. It is fixed for the lifetime of the File:
+	// a File is a snapshot of the file as it was when opened.
+	Size() int64
 }

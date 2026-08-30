@@ -131,6 +131,51 @@ if r, ok := fs.(filesystem.Resizer); ok {
 }
 ```
 
+- `Opener` / `File` — optional interface for **reading part of a file** without
+  materialising the whole thing. `Filesystem.ReadFile` is per-path and returns
+  the entire file, which no mount or network export can build on: serving a
+  4 KiB request out of a 4 GiB file would allocate 4 GiB. `Opener` is the
+  capability that makes those callers possible, and it is optional and
+  non-breaking — probe for it, fall back to `ReadFile` when a driver lacks it:
+
+```go
+type Opener interface {
+    OpenFile(path string) (File, error)
+}
+
+type File interface {
+    io.ReaderAt
+    io.Closer
+    Size() int64
+}
+
+if o, ok := fs.(filesystem.Opener); ok {
+    f, err := o.OpenFile("/big.img")
+    if err != nil {
+        return err
+    }
+    defer f.Close()
+    n, err := f.ReadAt(buf, off) // only the bytes asked for
+    _, _ = n, err
+} else {
+    data, err := fs.ReadFile("/big.img") // fallback: the whole file
+    _, _ = data, err
+}
+```
+
+  `ReadAt` follows `io.ReaderAt` **to the letter**: `n < len(p)` only ever comes
+  back with a non-nil error, end of file reports `io.EOF`, and an offset at or
+  past `Size()` returns `0, io.EOF`. Anything looser breaks `io.SectionReader`
+  and every consumer built on it, silently. Reads are safe to issue
+  concurrently on one `File`, as `io.ReaderAt` requires. `Size()` comes from
+  metadata already read at open time, so a caller can answer a stat without
+  touching the data.
+
+  A driver whose format genuinely cannot answer a byte range without decoding
+  everything before it should simply *not* implement `Opener`, rather than
+  emulate it with a hidden full read — the probe exists so the caller learns
+  the truth.
+
 - `DirEntry` — accessor interface for directory entries:
 
 ```go
