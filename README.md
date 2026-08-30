@@ -176,6 +176,59 @@ if o, ok := fs.(filesystem.Opener); ok {
   emulate it with a hidden full read — the probe exists so the caller learns
   the truth.
 
+- `WritableFile` — the **write-side twin** of `Opener`/`File`: the optional
+  upgrade of a `File`, for a driver that can **write at an offset in place**.
+  `Filesystem`'s only write is `WriteFile`, which replaces the *whole* file, so
+  a caller handed a write at a non-zero offset must read the file, splice, and
+  write it all back — O(filesize) per request, and O(n²) for a client streaming
+  a file in blocks. Measured, not supposed: a 2 MiB sequential write over a real
+  NFS mount in 64 KiB blocks took **23 s (90 kB/s)**, and a `soft` mount gave up
+  with `EIO` partway through.
+
+```go
+type WritableFile interface {
+    File            // io.ReaderAt + io.Closer + Size() int64
+    io.WriterAt
+    Truncate(size int64) error
+    Sync() error
+}
+
+f, err := o.OpenFile(path)
+if err != nil {
+    return err
+}
+defer f.Close()
+if w, ok := f.(filesystem.WritableFile); ok {
+    if _, err := w.WriteAt(p, off); err != nil { // only the bytes given
+        return err
+    }
+    return w.Sync()
+}
+// otherwise: ReadFile, splice, WriteFile — correct, and quadratic.
+```
+
+  The probe is on the **`File`**, not on the `Filesystem`, because writability
+  is a property of the opened object. A read-only driver (`iso9660`,
+  `squashfs`) simply returns a plain `File` and nothing breaks: `Filesystem`,
+  `Opener` and `File` are all unchanged.
+
+  `WriteAt` follows `io.WriterAt` **to the letter**: it writes `len(p)` bytes
+  or returns a non-nil error — never a short write with a nil error, which a
+  caller reads as success. Whether it may *extend* the file is the driver's to
+  state, and each one states it; a driver that cannot extend refuses the write
+  rather than writing short. Concurrent `WriteAt` calls are safe **provided
+  their ranges do not overlap**, which is `io.WriterAt`'s own wording.
+
+  `Size()` on a `WritableFile` is *not* the frozen snapshot `File` describes:
+  it reflects this handle's own writes, so it follows an extending `WriteAt` or
+  a `Truncate` with no I/O and no reopen.
+
+  `Sync()` exists because a network server must be able to answer *"it is on
+  the medium"* as an event distinct from *"I accepted the write"* — NFSv3
+  `COMMIT` (RFC 1813 §3.21) and SFTP's `fsync@openssh.com` both demand exactly
+  that answer. A driver whose `Sync` guarantees nothing must say so, rather
+  than return `nil` and let the caller promise durability it has not got.
+
 - `DirEntry` — accessor interface for directory entries:
 
 ```go

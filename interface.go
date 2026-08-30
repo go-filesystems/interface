@@ -285,3 +285,100 @@ type File interface {
 	// a File is a snapshot of the file as it was when opened.
 	Size() int64
 }
+
+// WritableFile is the optional upgrade of a File returned by OpenFile: a
+// driver that can write in place returns one, and a caller assertion-tests for
+// it exactly as it does for Opener.
+//
+// # Why it exists
+//
+// Filesystem's only write is WriteFile(path, data, perm): it replaces the
+// WHOLE file. There is no positional write, so a caller that receives a write
+// at a non-zero offset — an NFS or 9P export, a WebDAV or SFTP server, a
+// loop-mounted image — has to read the entire file, splice the new bytes in,
+// and write the whole thing back. That is O(filesize) per request, so a client
+// streaming a file in fixed-size blocks costs O(n²) in total. This is not a
+// theoretical cost: a 2 MiB sequential write over a real NFS mount, in 64 KiB
+// blocks, took 23 seconds — 90 kB/s — and a soft-mounted client gave up with
+// EIO partway through, because one round-trip exceeded its timeout.
+//
+// WritableFile is the write-side twin of Opener and closes that gap the same
+// way: File already carries the per-file state the driver resolved at open
+// time (an extent list, a cluster chain, a block map), and a positional write
+// reuses it instead of rebuilding the file from its path on every call.
+//
+// # Optional and non-breaking
+//
+// Filesystem, Opener and File are unchanged. A driver that cannot write in
+// place — a read-only format such as iso9660 or squashfs, or one whose write
+// path is not yet positional — simply does not return a WritableFile, and the
+// caller falls back to the read-modify-write it already has:
+//
+//	f, err := o.OpenFile(path)
+//	if err != nil {
+//	    return err
+//	}
+//	defer f.Close()
+//	if w, ok := f.(filesystem.WritableFile); ok {
+//	    if _, err := w.WriteAt(p, off); err != nil {
+//	        return err
+//	    }
+//	    return w.Sync()
+//	}
+//	// otherwise: ReadFile, splice, WriteFile — correct, and quadratic.
+//
+// The probe is on the FILE, not on the Filesystem, because writability is a
+// property of the opened object: a driver may open a regular file writably and
+// still refuse — with a plain File — a path it cannot write positionally.
+//
+// # Size, and how it differs from a read-only File
+//
+// File documents Size as fixed for the File's lifetime, because a read-only
+// File is a snapshot. A WritableFile is not a snapshot: it is a handle the
+// caller mutates. Size therefore reflects this handle's own writes — after a
+// WriteAt that extends the file, or a Truncate, Size returns the new length,
+// with no I/O and no reopen. It still says nothing about changes made through
+// another handle or through Filesystem's path-based calls; a File never
+// promised to observe those.
+//
+// # Concurrency
+//
+// The same terms as io.ReaderAt and io.WriterAt, no more and no less:
+// concurrent ReadAt calls are safe, and concurrent WriteAt calls are safe
+// PROVIDED their byte ranges do not overlap — that is io.WriterAt's own
+// wording, and callers must respect it. Truncate and Sync change or observe
+// the whole file, so they are not safe against a concurrent WriteAt; a caller
+// that issues them serialises against its own writes.
+type WritableFile interface {
+	File
+	io.WriterAt
+
+	// Truncate resizes the file to size bytes. Growing extends it with
+	// zeros — sparsely where the format allows, so growing must not be
+	// assumed to allocate. Shrinking drops the trailing bytes and releases
+	// what the format lets the driver release. Size reports the new length
+	// once Truncate returns nil.
+	//
+	// A negative size is an error. This is the file-scoped twin of the
+	// path-scoped Truncater capability on Filesystem; they do not collide,
+	// having different receivers, and a driver may well implement both.
+	Truncate(size int64) error
+
+	// Sync blocks until every byte written through this File has reached the
+	// filesystem's backing store, and returns the error if it could not.
+	//
+	// It exists because a network server has to be able to answer "it is on
+	// the medium" as a distinct, later event from "I accepted the write":
+	// NFSv3 COMMIT (RFC 1813 §3.21) and SFTP's fsync@openssh.com extension
+	// both require exactly that answer, and neither can be given honestly by
+	// a driver that only ever buffers. A server that cannot commit must
+	// report unstable writes instead of claiming stability it has not got.
+	//
+	// What "backing store" means is the driver's to state, and each one must
+	// state it: for an image-backed driver it is the io.WriterAt it was
+	// handed, which may itself be an *os.File whose own Sync the driver
+	// calls, or a buffer in memory for which Sync is a no-op that returns
+	// nil. Returning nil from a Sync that guarantees nothing is a lie the
+	// caller cannot detect, so a driver in that position documents it.
+	Sync() error
+}
