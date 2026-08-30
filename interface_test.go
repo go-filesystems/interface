@@ -2,6 +2,7 @@ package filesystem
 
 import (
 	"errors"
+	"io"
 	"os"
 	"testing"
 	"time"
@@ -181,5 +182,131 @@ func TestNewStat(t *testing.T) {
 	}
 	if stat.Inode() != 12 {
 		t.Fatalf("Inode() = %d, want 12", stat.Inode())
+	}
+}
+
+// memFile is a minimal, correct File implementation over a byte slice. It
+// exists to pin the io.ReaderAt semantics this package documents: short read
+// only with a non-nil error, io.EOF at the end, offsets independent between
+// calls. Drivers in sibling repos are expected to behave exactly like this.
+type memFile struct{ b []byte }
+
+func (f *memFile) Size() int64  { return int64(len(f.b)) }
+func (f *memFile) Close() error { return nil }
+
+func (f *memFile) ReadAt(p []byte, off int64) (int, error) {
+	if off < 0 {
+		return 0, errors.New("filesystem: negative offset")
+	}
+	if off >= int64(len(f.b)) {
+		return 0, io.EOF
+	}
+	n := copy(p, f.b[off:])
+	if n < len(p) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+// openerFS models a driver that can serve byte ranges.
+type openerFS struct {
+	fakeFS
+	data map[string][]byte
+}
+
+func (fs openerFS) OpenFile(path string) (File, error) {
+	b, ok := fs.data[path]
+	if !ok {
+		return nil, os.ErrNotExist
+	}
+	return &memFile{b: b}, nil
+}
+
+var (
+	_ Opener = (*openerFS)(nil)
+	_ File   = (*memFile)(nil)
+)
+
+func TestOpenerProbe(t *testing.T) {
+	// A driver with the capability answers the probe...
+	var fs Filesystem = openerFS{data: map[string][]byte{"/a": []byte("hello")}}
+	o, ok := fs.(Opener)
+	if !ok {
+		t.Fatal("Opener probe failed on openerFS")
+	}
+
+	// ...and a driver without it does not, which is the whole point: the
+	// caller falls back to ReadFile instead of failing.
+	var bare Filesystem = fakeFS{}
+	if _, ok := bare.(Opener); ok {
+		t.Error("Opener probe unexpectedly succeeded on fakeFS")
+	}
+	if _, ok := bare.(Opener); !ok {
+		if _, err := bare.ReadFile("/a"); err != nil {
+			t.Errorf("ReadFile fallback failed: %v", err)
+		}
+	}
+
+	if _, err := o.OpenFile("/missing"); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("OpenFile(missing) = %v, want os.ErrNotExist", err)
+	}
+
+	f, err := o.OpenFile("/a")
+	if err != nil {
+		t.Fatalf("OpenFile: %v", err)
+	}
+	defer f.Close()
+	if got := f.Size(); got != 5 {
+		t.Fatalf("Size() = %d, want 5", got)
+	}
+}
+
+// TestFileReadAtSemantics pins the three rules the doc comment on File makes
+// binding, using the reference implementation. A driver that violates any of
+// them breaks io.SectionReader silently, so they are asserted here as the
+// canonical expectations.
+func TestFileReadAtSemantics(t *testing.T) {
+	f := &memFile{b: []byte("0123456789")}
+
+	// Full read in the middle: n == len(p), nil error.
+	p := make([]byte, 4)
+	n, err := f.ReadAt(p, 2)
+	if n != 4 || err != nil || string(p) != "2345" {
+		t.Fatalf("ReadAt(4, 2) = %d, %v, %q", n, err, p)
+	}
+
+	// Read straddling the end: short read WITH io.EOF, bytes still delivered.
+	p = make([]byte, 4)
+	n, err = f.ReadAt(p, 8)
+	if n != 2 || !errors.Is(err, io.EOF) || string(p[:n]) != "89" {
+		t.Fatalf("ReadAt(4, 8) = %d, %v, %q", n, err, p[:n])
+	}
+
+	// Exactly at EOF and past it: 0, io.EOF.
+	if n, err := f.ReadAt(p, 10); n != 0 || !errors.Is(err, io.EOF) {
+		t.Fatalf("ReadAt at Size() = %d, %v, want 0, io.EOF", n, err)
+	}
+	if n, err := f.ReadAt(p, 99); n != 0 || !errors.Is(err, io.EOF) {
+		t.Fatalf("ReadAt past Size() = %d, %v, want 0, io.EOF", n, err)
+	}
+
+	// Negative offset is an error, never a panic.
+	if n, err := f.ReadAt(p, -1); n != 0 || err == nil {
+		t.Fatalf("ReadAt(-1) = %d, %v, want an error", n, err)
+	}
+
+	// A File is usable as an io.SectionReader source — the consumer whose
+	// assumptions the contract exists to protect.
+	sr := io.NewSectionReader(f, 3, 4)
+	got, err := io.ReadAll(sr)
+	if err != nil {
+		t.Fatalf("ReadAll(SectionReader): %v", err)
+	}
+	if string(got) != "3456" {
+		t.Fatalf("SectionReader gave %q, want %q", got, "3456")
+	}
+
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
 	}
 }
