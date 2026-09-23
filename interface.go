@@ -62,6 +62,38 @@ func NewStat(mode uint16, size uint64, inode uint64) Stat {
 
 // Filesystem defines a minimal common API implemented by concrete
 // filesystem packages (ext4, xfs, btrfs).
+//
+// # ⛔⛔ THE ERROR CONTRACT, WHICH THIS INTERFACE NEVER STATED
+//
+// A path that is not there must return an error satisfying
+// errors.Is(err, [io/fs.ErrNotExist]). Permission must satisfy
+// fs.ErrPermission, and a path that already exists where one must not,
+// fs.ErrExist.
+//
+// This was never written down, so it did not happen. Measured 2026-09-23
+// across the family: TWELVE of fourteen drivers return a bare fmt.Errorf --
+// fat32 answers `fat32: "/x" not found`, which errors.Is cannot classify.
+// Only apfs returns os.ErrNotExist.
+//
+// That is not a tidiness question. Every server in the family classifies with
+// errors.Is and nothing else:
+//
+//	go-filesystems/webdav  statusFor()  -> 500 where it means 404
+//	go-filesystems/nfs                  -> the same shape
+//	go-filesystems/sftp                 -> the same shape
+//
+// So a missing file over WebDAV answers 500 today, on every driver but one.
+// To an HTTP or S3 client that difference decides whether to RETRY: a 500 is
+// retryable and a 404 is not, so the wrong error turns one missing file into a
+// storm of requests.
+//
+// Wrapping is enough, and keeps the driver's own message:
+//
+//	return nil, fmt.Errorf("fat32: %q not found: %w", path, fs.ErrNotExist)
+//
+// A driver that cannot tell the cases apart should return the closest one it
+// can justify rather than none: a caller can act on fs.ErrNotExist and cannot
+// act on an unclassifiable string.
 type Filesystem interface {
 	Close() error
 	ReadFile(path string) ([]byte, error)
