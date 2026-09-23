@@ -75,17 +75,30 @@ func NewStat(mode uint16, size uint64, inode uint64) Stat {
 // fat32 answers `fat32: "/x" not found`, which errors.Is cannot classify.
 // Only apfs returns os.ErrNotExist.
 //
-// That is not a tidiness question. Every server in the family classifies with
-// errors.Is and nothing else:
+// That is not a tidiness question, but it is also not the one this paragraph
+// first claimed. ⚠ AN EARLIER VERSION OF THIS COMMENT SAID WEBDAV ANSWERS 500
+// FOR A MISSING FILE. IT DOES NOT, AND THE CORRECTION IS THE POINT.
 //
-//	go-filesystems/webdav  statusFor()  -> 500 where it means 404
-//	go-filesystems/nfs                  -> the same shape
-//	go-filesystems/sftp                 -> the same shape
+// Measured, before and after wrapping fat32: GET of a missing file answered
+// 404 both times. webdav's statusFor tries errors.Is FIRST and then falls back
+// to a table of twelve message fragments -- "not found", "no such", "does not
+// exist", and nine more -- so it catches today's drivers by their phrasing.
+// The claim came from reading the errors.Is switch and stopping before the
+// fallback underneath it.
 //
-// So a missing file over WebDAV answers 500 today, on every driver but one.
-// To an HTTP or S3 client that difference decides whether to RETRY: a 500 is
-// retryable and a 404 is not, so the wrong error turns one missing file into a
-// storm of requests.
+// The real cost is what that fallback IS. go-filesystems/nfs carries the same
+// twelve-entry table, copied, and webdav's own comment on it says:
+//
+//	this is a *last* resort ... The real fix belongs upstream: sentinel
+//	errors in the interface module that every driver wraps.
+//
+// So correctness currently depends on how each driver PHRASES its errors. A
+// driver that says "cannot locate" rather than "not found" gets the fallback
+// status silently, with no test failing anywhere, and the same list has to be
+// kept true in two repositories at once.
+//
+// go-filesystems/s3 had no such table and got InternalError for a missing key,
+// which is what surfaced this at all.
 //
 // Wrapping is enough, and keeps the driver's own message:
 //
