@@ -71,9 +71,45 @@ func NewStat(mode uint16, size uint64, inode uint64) Stat {
 // fs.ErrExist.
 //
 // This was never written down, so it did not happen. Measured 2026-09-23
-// across the family: TWELVE of fourteen drivers return a bare fmt.Errorf --
-// fat32 answers `fat32: "/x" not found`, which errors.Is cannot classify.
-// Only apfs returns os.ErrNotExist.
+// across the family: TWELVE of fourteen drivers returned a bare fmt.Errorf --
+// fat32 answered `fat32: "/x" not found`, which errors.Is cannot classify.
+// Only apfs returned os.ErrNotExist.
+//
+// Re-measured 2026-09-24: all fourteen satisfy it. ffs is a re-export of ufs
+// and has no error sites of its own. Each driver carries an
+// errnotexist_test.go asserting the contract on its own operations, so the
+// next driver that stops satisfying it fails in its own repository rather
+// than at a server three modules away.
+//
+// # ⛔⛔ HOW A DRIVER SATISFIES IT MATTERS MORE THAN THAT IT DOES
+//
+// The last four took a week longer than the other ten, and not for want of
+// effort: wrapping them the obvious way would have been WORSE than leaving
+// them alone, and the reason generalises to whatever driver comes next.
+//
+// btrfs and xfs each raise ONE sentinel from two unrelated kinds of failure:
+//
+//   - a name that is not in a directory                    -> 404
+//   - a B-tree descent, or a directory format, that fails  -> the image is
+//     corrupt
+//
+// Wrapping the sentinel satisfies this contract and makes every server in
+// this family answer "not found" for a broken filesystem. The fault then
+// reaches a user as a routine 404 and nothing anywhere reports it. So in both
+// drivers the marking is placed at the PATH BOUNDARY, on the error rather
+// than the call site, and each carries a second test asserting that a
+// structural failure is NOT fs.ErrNotExist.
+//
+// zfs and uefi needed one line each, because neither had ever overloaded its
+// sentinel: zfs raises errNotFound at twenty-six sites and all twenty-six are
+// a named thing that is not there, while a damaged ZAP returns its own
+// unclassified error; uefi's is a linear scan of a slice, and a store that
+// cannot be parsed fails earlier, in Open.
+//
+// The rule, for the next driver: BEFORE wrapping a sentinel, find every place
+// that raises it. If any of them means "this image is not what it claims to
+// be", the sentinel is the wrong place and the path boundary is the right
+// one.
 //
 // That is not a tidiness question, but it is also not the one this paragraph
 // first claimed. ⚠ AN EARLIER VERSION OF THIS COMMENT SAID WEBDAV ANSWERS 500
