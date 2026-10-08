@@ -628,3 +628,48 @@ func (fs writableOpenerFS) OpenFile(path string) (File, error) {
 }
 
 var _ Opener = (*writableOpenerFS)(nil)
+
+// hostFile shows what a HostFile is made of: a File, a ReadSeeker and a
+// syscall.Conn, and the method that says so on purpose.
+type hostFile struct {
+	*os.File
+}
+
+func (h hostFile) Size() int64 {
+	st, err := h.Stat()
+	if err != nil {
+		return 0
+	}
+	return st.Size()
+}
+func (hostFile) HostFile() {}
+
+var _ HostFile = hostFile{}
+
+// Embedding an *os.File gives Read, Seek and SyscallConn, which is exactly
+// why they cannot be the promise: such a File is not a HostFile until it
+// says so.
+func TestAnEmbeddedOSFileIsNotAHostFileByAccident(t *testing.T) {
+	f, err := os.Open(os.Args[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	type imageFile struct {
+		*os.File
+		size int64
+	}
+	var plain any = imageFile{File: f}
+	if _, ok := plain.(HostFile); ok {
+		t.Fatal("a File that only embeds *os.File passed as a HostFile")
+	}
+	var host any = hostFile{f}
+	h, ok := host.(HostFile)
+	if !ok {
+		t.Fatal("hostFile is not a HostFile")
+	}
+	h.HostFile()
+	if h.Size() <= 0 {
+		t.Fatal("hostFile has no size")
+	}
+}
