@@ -99,6 +99,25 @@ type MetadataSetter interface {
 }
 ```
 
+- `TimesReader` — optional read side of the timestamps `Chtimes` writes. One
+  call returns all four (`Atime`, `Mtime`, `Ctime`, `Btime`) as `Timestamp`
+  values. A time the format does not keep is the zero `Timestamp`, never a
+  zero `time.Time`: `Get()` returns `(time, ok)` and `Or(fallback)` makes the
+  caller name the substitute. `Resolution()` reports the format's unit (FAT
+  mtime 2 s, atime 1 day, HFS+ 1 s, NTFS 100 ns, ext4 1 ns) and `Same`
+  compares at the coarser of two:
+
+```go
+type TimesReader interface {
+    Times(path string) (FileTimes, error)
+}
+
+if tr, ok := fs.(filesystem.TimesReader); ok {
+    ft, _ := tr.Times(path)
+    mtime := ft.Mtime.Or(time.Now())
+}
+```
+
 - `Truncater` — optional interface for resizing a regular file in place
   (grow zero-fills, shrink drops trailing data):
 
